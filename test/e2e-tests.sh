@@ -114,6 +114,10 @@ readonly SYSTEM_NAMESPACE="knative-eventing"
 
 # Zipkin setup
 readonly KNATIVE_EVENTING_MONITORING_YAML="test/config/monitoring.yaml"
+readonly KNATIVE_EVENTING_CHAOSDUCK_YAML="test/config/chaosduck.yaml"
+
+# The number of control plane replicas to run.
+readonly REPLICAS=${REPLICAS:-3}
 
 #
 # TODO - Consider adding this function to the test-infra library.sh utilities ?
@@ -264,6 +268,9 @@ function install_consolidated_channel_crds() {
   cp "${CONSOLIDATED_TEMPLATE_DIR}/"*yaml "${KAFKA_CRD_CONFIG_DIR}"
   sed -i "s/REPLACE_WITH_CLUSTER_URL/${KAFKA_CLUSTER_URL}/" ${KAFKA_CRD_CONFIG_DIR}/${KAFKA_CRD_CONFIG_TEMPLATE}
   ko apply -f "${KAFKA_CRD_CONFIG_DIR}" || return 1
+
+  scale_controlplane kafka-ch-controller kafka-ch-dispatcher kafka-webhook
+
   wait_until_pods_running knative-eventing || fail_test "Failed to install the consolidated Kafka Channel CRD"
 }
 
@@ -290,6 +297,13 @@ function uninstall_sources_crds() {
   ko delete --ignore-not-found=true --now --timeout 120s -f "${KAFKA_SOURCE_CRD_CONFIG_DIR}"
 }
 
+function install_duck() {
+  ko apply -f ${KNATIVE_EVENTING_CHAOSDUCK_YAML} || return 1
+}
+function uninstall_duck() {
+  ko delete --ignore-not-found=true --now --timeout 120s -f ${KNATIVE_EVENTING_CHAOSDUCK_YAML} || return 1
+}
+
 function install_distributed_channel_crds() {
   echo "Installing distributed Kafka Channel CRD"
   rm "${KAFKA_CRD_CONFIG_DIR}/"*yaml
@@ -308,6 +322,17 @@ function install_distributed_channel_crds() {
   add_kn_eventing_test_pull_secret knative-eventing eventing-kafka-channel-controller eventing-kafka-channel-controller
 
   wait_until_pods_running knative-eventing || fail_test "Failed to install the distributed Kafka Channel CRD"
+}
+
+function scale_controlplane() {
+  for deployment in "$@"; do
+    # Make sure all pods run in leader-elected mode.
+    kubectl -n knative-eventing scale deployment "$deployment" --replicas=0 || fail_test "Failed to scale down to 0 ${deployment}"
+    # Give it time to kill the pods.
+    sleep 5
+    # Scale up components for HA tests
+    kubectl -n knative-eventing scale deployment "$deployment" --replicas="${REPLICAS}" || fail_test "Failed to scale up to ${REPLICAS} ${deployment}"
+  done
 }
 
 function kafka_setup() {
@@ -378,10 +403,12 @@ function test_consolidated_channel_plain() {
   echo "Testing the consolidated channel and source"
   install_consolidated_channel_crds || return 1
   install_consolidated_sources_crds || return 1
+  install_duck || return 1
 
   go_test_e2e -tags=e2e,source -timeout=40m -test.parallel=${TEST_PARALLEL} ./test/e2e -channels=messaging.knative.dev/v1alpha1:KafkaChannel,messaging.knative.dev/v1beta1:KafkaChannel  || fail_test
   go_test_e2e -tags=e2e,source -timeout=5m -test.parallel=${TEST_PARALLEL} ./test/conformance -channels=messaging.knative.dev/v1beta1:KafkaChannel -sources=sources.knative.dev/v1beta1:KafkaSource || fail_test
 
+  uninstall_duck || return 1
   uninstall_sources_crds || return 1
   uninstall_channel_crds || return 1
 }
