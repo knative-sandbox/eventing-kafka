@@ -106,9 +106,10 @@ type Reconciler struct {
 
 	configs KafkaSourceConfigAccessor
 
-	podIpGetter             ctrlreconciler.PodIpGetter
-	connectionPool          *ctrlreconciler.ControlPlaneConnectionPool
-	claimsNotificationStore *ctrlreconciler.NotificationStore
+	podIpGetter                     ctrlreconciler.PodIpGetter
+	connectionPool                  *ctrlreconciler.ControlPlaneConnectionPool
+	contractUpdateNotificationStore *ctrlreconciler.AsyncCommandNotificationStore
+	claimsNotificationStore         *ctrlreconciler.NotificationStore
 }
 
 // Check that our Reconciler implements Interface
@@ -196,7 +197,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, src *v1beta1.KafkaSource
 
 	// Reconcile connections
 	srcNamespacedName := types.NamespacedName{Name: src.Name, Namespace: src.Namespace}
-	_, err = r.connectionPool.ReconcileConnections(
+	connections, err := r.connectionPool.ReconcileConnections(
 		ctx,
 		string(src.UID),
 		podIPs,
@@ -212,9 +213,14 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, src *v1beta1.KafkaSource
 					newHost,
 					kafkasourcecontrol.ClaimsDifference,
 				),
+				kafkasourcecontrol.NotifyContractUpdated: r.contractUpdateNotificationStore.MessageHandler(
+					srcNamespacedName,
+					newHost,
+				),
 			})
 		},
 		func(oldHost string) {
+			r.contractUpdateNotificationStore.CleanPodNotification(srcNamespacedName, oldHost)
 			r.claimsNotificationStore.CleanPodNotification(srcNamespacedName, oldHost)
 		},
 	)
@@ -223,6 +229,37 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, src *v1beta1.KafkaSource
 	}
 
 	logging.FromContext(ctx).Debugf("Control connections reconciled")
+
+	logging.FromContext(ctx).Debugf("Going to send the contract")
+
+	for host, conn := range connections {
+		contract := kafkasourcecontrol.KafkaSourceContract{
+			Generation:       src.Generation,
+			BootstrapServers: src.Spec.BootstrapServers,
+			Topics:           src.Spec.Topics,
+			ConsumerGroup:    src.Spec.ConsumerGroup,
+			KeyType:          src.GetLabels()[v1beta1.KafkaKeyTypeLabel],
+		}
+		err := conn.SendAndWaitForAck(kafkasourcecontrol.SetContractCommand, contract)
+		if err != nil {
+			src.Status.MarkFailedToPropagateDataPlaneContract("error while sending the contract to %s: %v", host, err)
+			return fmt.Errorf("error while sending the contract to %s: %w", host, err)
+		}
+		src.Status.MarkPropagatingContractToDataPlane()
+
+		commandResult := r.contractUpdateNotificationStore.GetCommandResult(srcNamespacedName, host, &contract)
+		if commandResult == nil {
+			// Short-circuit while waiting for the update
+			return nil
+		}
+
+		if commandResult.Error != "" {
+			src.Status.MarkFailedToPropagateDataPlaneContract("receive adapter '%s' failed to apply the new contract: %v", host, commandResult.Error)
+			return fmt.Errorf("receive adapter '%s' failed to apply the new contract: %v", host, commandResult.Error)
+		}
+
+		src.Status.MarkDataPlaneContractPropagated()
+	}
 
 	// Update consumer group status
 	lastClaimStatus, ok := r.claimsNotificationStore.GetPodsNotifications(srcNamespacedName)
@@ -238,6 +275,10 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, src *v1beta1.KafkaSource)
 	r.connectionPool.RemoveAllConnections(ctx, string(src.UID))
 
 	r.claimsNotificationStore.CleanPodsNotifications(types.NamespacedName{
+		Namespace: src.Namespace,
+		Name:      src.Name,
+	})
+	r.contractUpdateNotificationStore.CleanPodsNotifications(types.NamespacedName{
 		Namespace: src.Namespace,
 		Name:      src.Name,
 	})

@@ -22,19 +22,25 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/cloudevents/sdk-go/v2/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
+	"knative.dev/eventing-kafka/pkg/common/consumer"
 	"knative.dev/eventing/pkg/adapter/v2"
 	"knative.dev/pkg/source"
 
 	"knative.dev/eventing/pkg/kncloudevents"
 
 	sourcesv1beta1 "knative.dev/eventing-kafka/pkg/apis/sources/v1beta1"
+
+	consumertesting "knative.dev/eventing-kafka/pkg/channel/distributed/common/kafka/consumer/testing"
 )
 
 func TestPostMessage_ServeHTTP_binary_mode(t *testing.T) {
@@ -429,16 +435,105 @@ func sinkRejected(writer http.ResponseWriter, _ *http.Request) {
 	writer.WriteHeader(http.StatusRequestTimeout)
 }
 
-func TestAdapter_Start(t *testing.T) { // just increase code coverage
+func TestAdapter_Start_Fails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
-	// Increasing coverage
-	_ = os.Setenv("KAFKA_BOOTSTRAP_SERVERS", "my-cluster-kafka-bootstrap.my-kafka-namespace:9092")
+	adapterConfig := NewEnvConfig()
 
-	a := NewAdapter(ctx, NewEnvConfig(), nil, nil)
+	a := NewAdapter(ctx, adapterConfig, nil, nil)
 	err := a.Start(ctx)
 	if err == nil {
 		t.Errorf("expected error, but got nil")
 	}
+}
+
+func TestAdapter_SetRateLimits(t *testing.T) {
+	// This is to increase coverage
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	adapterConfig := NewEnvConfig()
+	a := NewAdapter(ctx, adapterConfig, nil, nil)
+	a.(*Adapter).SetRateLimits(rate.Every(100*time.Millisecond), 10)
+}
+
+func TestAdapter_GetConsumerGroup(t *testing.T) {
+	// This is to increase coverage
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	consumerGroupName := "abc"
+
+	adapterConfig := NewEnvConfig()
+	adapterConfig.(*AdapterConfig).ConsumerGroup = consumerGroupName
+	a := NewAdapter(ctx, adapterConfig, nil, nil)
+	require.Equal(t, consumerGroupName, a.(*Adapter).GetConsumerGroup())
+}
+
+type kafkaConsumerGroupFactory struct {
+	mockConsumerGroup *mockConsumerGroup
+}
+
+func (k *kafkaConsumerGroupFactory) StartConsumerGroup(groupID string, topics []string, logger *zap.SugaredLogger, handler consumer.KafkaConsumerHandler, options ...consumer.SaramaConsumerHandlerOption) (sarama.ConsumerGroup, error) {
+	k.mockConsumerGroup.Consume(context.Background(), []string{}, nil)
+	return k.mockConsumerGroup, nil
+}
+
+type mockConsumerGroup struct {
+	*consumertesting.MockConsumerGroup
+	mutex          sync.Mutex
+	invokedConsume *sync.WaitGroup
+}
+
+func (m *mockConsumerGroup) Consume(ctx context.Context, addrs []string, h sarama.ConsumerGroupHandler) error {
+	m.mutex.Lock()
+	if m.MockConsumerGroup == nil || m.MockConsumerGroup.Closed {
+		m.MockConsumerGroup = consumertesting.NewMockConsumerGroup()
+	}
+	m.mutex.Unlock()
+	m.invokedConsume.Done()
+	go func() {
+		m.mutex.Lock()
+		defer m.mutex.Unlock()
+		_ = m.MockConsumerGroup.Consume(ctx, addrs, h)
+	}()
+	return nil
+}
+
+func TestAdapter_Start_Succeeds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	adapterConfig := NewEnvConfig()
+
+	var invokedConsume sync.WaitGroup
+	invokedConsume.Add(1)
+	mockConsumerGroupInstance := &mockConsumerGroup{
+		invokedConsume: &invokedConsume,
+	}
+
+	a := NewAdapter(ctx, adapterConfig, nil, nil)
+	a.(*Adapter).newConsumerGroupFactory = func(addrs []string, config *sarama.Config) consumer.KafkaConsumerGroupFactory {
+		return &kafkaConsumerGroupFactory{
+			mockConsumerGroup: mockConsumerGroupInstance,
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		assert.NoError(t, a.Start(ctx))
+	}()
+
+	// Wait for consume to be invoked
+	invokedConsume.Wait()
+
+	// Close the start method
 	cancel()
+
+	// Start method should end
+	wg.Wait()
+
+	require.True(t, mockConsumerGroupInstance.MockConsumerGroup.Closed)
 }

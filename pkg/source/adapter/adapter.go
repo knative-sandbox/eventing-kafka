@@ -26,9 +26,6 @@ import (
 
 	"golang.org/x/time/rate"
 
-	ctrl "knative.dev/control-protocol/pkg"
-	ctrlnetwork "knative.dev/control-protocol/pkg/network"
-
 	"github.com/Shopify/sarama"
 	"go.opencensus.io/trace"
 	"go.uber.org/zap"
@@ -41,7 +38,6 @@ import (
 
 	"knative.dev/eventing-kafka/pkg/common/consumer"
 	"knative.dev/eventing-kafka/pkg/source/client"
-	kafkasourcecontrol "knative.dev/eventing-kafka/pkg/source/control"
 )
 
 const (
@@ -52,13 +48,10 @@ type AdapterConfig struct {
 	adapter.EnvConfig
 	client.KafkaEnvConfig
 
-	Topics        []string `envconfig:"KAFKA_TOPICS" required:"true"`
-	ConsumerGroup string   `envconfig:"KAFKA_CONSUMER_GROUP" required:"true"`
+	Topics        []string `envconfig:"KAFKA_TOPICS" required:"false"`
+	ConsumerGroup string   `envconfig:"KAFKA_CONSUMER_GROUP" required:"false"`
 	Name          string   `envconfig:"NAME" required:"true"`
 	KeyType       string   `envconfig:"KEY_TYPE" required:"false"`
-
-	// Turn off the control server.
-	DisableControlServer bool
 }
 
 func NewEnvConfig() adapter.EnvConfigAccessor {
@@ -66,14 +59,15 @@ func NewEnvConfig() adapter.EnvConfigAccessor {
 }
 
 type Adapter struct {
-	config        *AdapterConfig
-	controlServer *ctrlnetwork.ControlServer
+	config *AdapterConfig
 
 	httpMessageSender *kncloudevents.HTTPMessageSender
 	reporter          pkgsource.StatsReporter
 	logger            *zap.SugaredLogger
 	keyTypeMapper     func([]byte) interface{}
 	rateLimiter       *rate.Limiter
+
+	newConsumerGroupFactory func(addrs []string, config *sarama.Config) consumer.KafkaConsumerGroupFactory
 }
 
 var _ adapter.MessageAdapter = (*Adapter)(nil)
@@ -86,11 +80,12 @@ func NewAdapter(ctx context.Context, processed adapter.EnvConfigAccessor, httpMe
 	config := processed.(*AdapterConfig)
 
 	return &Adapter{
-		config:            config,
-		httpMessageSender: httpMessageSender,
-		reporter:          reporter,
-		logger:            logger,
-		keyTypeMapper:     getKeyTypeMapper(config.KeyType),
+		config:                  config,
+		httpMessageSender:       httpMessageSender,
+		reporter:                reporter,
+		logger:                  logger,
+		keyTypeMapper:           getKeyTypeMapper(config.KeyType),
+		newConsumerGroupFactory: consumer.NewConsumerGroupFactory,
 	}
 }
 func (a *Adapter) GetConsumerGroup() string {
@@ -106,52 +101,19 @@ func (a *Adapter) Start(ctx context.Context) (err error) {
 		zap.String("Namespace", a.config.Namespace),
 	)
 
-	var options []consumer.SaramaConsumerHandlerOption
-
-	// Init control service
-	if !a.config.DisableControlServer {
-		a.controlServer, err = ctrlnetwork.StartInsecureControlServer(ctx)
-		if err != nil {
-			return err
-		}
-		a.controlServer.MessageHandler(a)
-
-		options = append(options, consumer.WithSaramaConsumerLifecycleListener(a))
+	consumerStoppedSignal, startupError := a.startConsumerGroup(ctx, consumer.WithSaramaConsumerLifecycleListener(a))
+	if startupError != nil {
+		return fmt.Errorf("cannot start the consumer group: %w", startupError)
 	}
 
-	// init consumer group
-	addrs, config, err := client.NewConfigWithEnv(context.Background(), &a.config.KafkaEnvConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create the config: %w", err)
-	}
+	// At this point, we do nothing, waiting for the first contract to come
+	// Environment variables are ignored and all the configuration comes from the control plane through the control protocol
 
-	consumerGroupFactory := consumer.NewConsumerGroupFactory(addrs, config)
-	group, err := consumerGroupFactory.StartConsumerGroup(
-		a.config.ConsumerGroup,
-		a.config.Topics,
-		a.logger,
-		a,
-		options...,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to start consumer group: %w", err)
-	}
-	defer func() {
-		err := group.Close()
-		if err != nil {
-			a.logger.Errorw("Failed to close consumer group", zap.Error(err))
-		}
-	}()
-
-	// Track errors
-	go func() {
-		for err := range group.Errors() {
-			a.logger.Errorw("Error while consuming messages", zap.Error(err))
-		}
-	}()
-
+	// This goroutine remains forever blocked until the adapter is closed
 	<-ctx.Done()
 	a.logger.Info("Shutting down...")
+	<-consumerStoppedSignal.Done()
+	a.logger.Info("Consumer group stopped")
 	return nil
 }
 
@@ -208,21 +170,45 @@ func (a *Adapter) SetRateLimits(r rate.Limit, b int) {
 	a.rateLimiter = rate.NewLimiter(r, b)
 }
 
-func (a *Adapter) HandleServiceMessage(ctx context.Context, message ctrl.ServiceMessage) {
-	// In this first PR, there is only the RA sending messages to control plane,
-	// there is no message the control plane should send to the RA
-	a.logger.Info("Received unexpected control message")
-	message.Ack()
+func (a *Adapter) startConsumerGroup(ctx context.Context, consumerGroupOptions ...consumer.SaramaConsumerHandlerOption) (context.Context, error) {
+	addrs, config, err := client.NewConfigWithEnv(context.Background(), &a.config.KafkaEnvConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the config: %w", err)
+	}
+
+	consumerGroupFactory := a.newConsumerGroupFactory(addrs, config)
+	group, err := consumerGroupFactory.StartConsumerGroup(
+		a.config.ConsumerGroup,
+		a.config.Topics,
+		a.logger,
+		a,
+		consumerGroupOptions...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start consumer group: %w", err)
+	}
+
+	closedSignal, cancel := context.WithCancel(context.Background())
+
+	// Goroutine to stop the thing
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				err := group.Close()
+				if err != nil {
+					a.logger.Errorw("Failed to close consumer group", zap.Error(err))
+				}
+				cancel()
+				return
+			case err := <-group.Errors():
+				a.logger.Errorw("Error while consuming messages", zap.Error(err))
+			}
+		}
+	}()
+	return closedSignal, nil
 }
 
-func (a *Adapter) Setup(sess sarama.ConsumerGroupSession) {
-	if err := a.controlServer.SendAndWaitForAck(kafkasourcecontrol.NotifySetupClaimsOpCode, kafkasourcecontrol.Claims(sess.Claims())); err != nil {
-		a.logger.Warnf("Cannot send the claims update: %v", err)
-	}
-}
+func (a *Adapter) Setup(sess sarama.ConsumerGroupSession) {}
 
-func (a *Adapter) Cleanup(sess sarama.ConsumerGroupSession) {
-	if err := a.controlServer.SendAndWaitForAck(kafkasourcecontrol.NotifyCleanupClaimsOpCode, kafkasourcecontrol.Claims(sess.Claims())); err != nil {
-		a.logger.Warnf("Cannot send the claims update: %v", err)
-	}
-}
+func (a *Adapter) Cleanup(sess sarama.ConsumerGroupSession) {}
