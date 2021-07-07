@@ -31,6 +31,7 @@ import (
 
 	duckv1alpha1 "knative.dev/eventing-kafka/pkg/apis/duck/v1alpha1"
 	"knative.dev/eventing-kafka/pkg/common/scheduler"
+	"knative.dev/eventing-kafka/pkg/common/scheduler/state"
 	tscheduler "knative.dev/eventing-kafka/pkg/common/scheduler/testing"
 )
 
@@ -46,7 +47,7 @@ func TestAutoscaler(t *testing.T) {
 		pendings        int32
 		scaleDown       bool
 		wantReplicas    int32
-		schedulerPolicy SchedulerPolicyType
+		schedulerPolicy scheduler.SchedulerPolicyType
 	}{
 		{
 			name:     "no replicas, no placements, no pending",
@@ -193,7 +194,7 @@ func TestAutoscaler(t *testing.T) {
 			},
 			pendings:        int32(3),
 			wantReplicas:    int32(3),
-			schedulerPolicy: EVENSPREAD,
+			schedulerPolicy: scheduler.EVENSPREAD,
 		},
 		{
 			name:     "with replicas, with placements, with pending, enough capacity",
@@ -205,7 +206,7 @@ func TestAutoscaler(t *testing.T) {
 			},
 			pendings:        int32(3),
 			wantReplicas:    int32(3),
-			schedulerPolicy: EVENSPREAD,
+			schedulerPolicy: scheduler.EVENSPREAD,
 		},
 		{
 			name:     "no replicas, with placements, with pending, enough capacity",
@@ -217,7 +218,7 @@ func TestAutoscaler(t *testing.T) {
 			},
 			pendings:        int32(3),
 			wantReplicas:    int32(3),
-			schedulerPolicy: EVENSPREAD_BYNODE,
+			schedulerPolicy: scheduler.EVENSPREAD_BYNODE,
 		},
 		{
 			name:     "with replicas, with placements, with pending, enough capacity",
@@ -229,20 +230,20 @@ func TestAutoscaler(t *testing.T) {
 			},
 			pendings:        int32(3),
 			wantReplicas:    int32(3),
-			schedulerPolicy: EVENSPREAD_BYNODE,
+			schedulerPolicy: scheduler.EVENSPREAD_BYNODE,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, _ := setupFakeContext(t)
+			ctx, _ := tscheduler.SetupFakeContext(t)
 
 			vpodClient := tscheduler.NewVPodClient()
 			ls := listers.NewListers(nil)
-			stateAccessor := newStateBuilder(ctx, vpodClient.List, 10, tc.schedulerPolicy, ls.GetNodeLister())
+			stateAccessor := state.NewStateBuilder(ctx, vpodClient.List, 10, tc.schedulerPolicy, ls.GetNodeLister())
 
 			sfsClient := kubeclient.Get(ctx).AppsV1().StatefulSets(testNs)
-			_, err := sfsClient.Create(ctx, makeStatefulset(testNs, sfsName, tc.replicas), metav1.CreateOptions{})
+			_, err := sfsClient.Create(ctx, tscheduler.MakeStatefulset(testNs, sfsName, tc.replicas), metav1.CreateOptions{})
 			if err != nil {
 				t.Fatal("unexpected error", err)
 			}
@@ -275,7 +276,7 @@ func TestAutoscaler(t *testing.T) {
 }
 
 func TestAutoscalerScaleDownToZero(t *testing.T) {
-	ctx, cancel := setupFakeContext(t)
+	ctx, cancel := tscheduler.SetupFakeContext(t)
 
 	afterUpdate := make(chan bool)
 	kubeclient.Get(ctx).PrependReactor("update", "statefulsets", func(action gtesting.Action) (handled bool, ret runtime.Object, err error) {
@@ -287,10 +288,10 @@ func TestAutoscalerScaleDownToZero(t *testing.T) {
 
 	vpodClient := tscheduler.NewVPodClient()
 	ls := listers.NewListers(nil)
-	stateAccessor := newStateBuilder(ctx, vpodClient.List, 10, MAXFILLUP, ls.GetNodeLister())
+	stateAccessor := state.NewStateBuilder(ctx, vpodClient.List, 10, scheduler.MAXFILLUP, ls.GetNodeLister())
 
 	sfsClient := kubeclient.Get(ctx).AppsV1().StatefulSets(testNs)
-	_, err := sfsClient.Create(ctx, makeStatefulset(testNs, sfsName, 10), metav1.CreateOptions{})
+	_, err := sfsClient.Create(ctx, tscheduler.MakeStatefulset(testNs, sfsName, 10), metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal("unexpected error", err)
 	}
@@ -336,7 +337,7 @@ func TestCompactor(t *testing.T) {
 		name            string
 		replicas        int32
 		vpods           []scheduler.VPod
-		schedulerPolicy SchedulerPolicyType
+		schedulerPolicy scheduler.SchedulerPolicyType
 		wantEvictions   map[types.NamespacedName]duckv1alpha1.Placement
 	}{
 		{
@@ -345,7 +346,7 @@ func TestCompactor(t *testing.T) {
 			vpods: []scheduler.VPod{
 				tscheduler.NewVPod(testNs, "vpod-1", 0, nil),
 			},
-			schedulerPolicy: MAXFILLUP,
+			schedulerPolicy: scheduler.MAXFILLUP,
 			wantEvictions:   nil,
 		},
 		{
@@ -356,7 +357,7 @@ func TestCompactor(t *testing.T) {
 					{PodName: "pod-0", VReplicas: int32(8)},
 					{PodName: "pod-1", VReplicas: int32(7)}}),
 			},
-			schedulerPolicy: MAXFILLUP,
+			schedulerPolicy: scheduler.MAXFILLUP,
 			wantEvictions:   nil,
 		},
 		{
@@ -367,7 +368,7 @@ func TestCompactor(t *testing.T) {
 					{PodName: "pod-0", VReplicas: int32(8)},
 					{PodName: "pod-1", VReplicas: int32(3)}}),
 			},
-			schedulerPolicy: MAXFILLUP,
+			schedulerPolicy: scheduler.MAXFILLUP,
 			wantEvictions:   nil,
 		},
 		{
@@ -378,7 +379,7 @@ func TestCompactor(t *testing.T) {
 					{PodName: "pod-0", VReplicas: int32(8)},
 					{PodName: "pod-1", VReplicas: int32(2)}}),
 			},
-			schedulerPolicy: MAXFILLUP,
+			schedulerPolicy: scheduler.MAXFILLUP,
 			wantEvictions: map[types.NamespacedName]duckv1alpha1.Placement{
 				{Name: "vpod-1", Namespace: testNs}: {PodName: "pod-1", VReplicas: int32(2)},
 			},
@@ -395,7 +396,7 @@ func TestCompactor(t *testing.T) {
 					{PodName: "pod-0", VReplicas: int32(2)},
 					{PodName: "pod-2", VReplicas: int32(7)}}),
 			},
-			schedulerPolicy: MAXFILLUP,
+			schedulerPolicy: scheduler.MAXFILLUP,
 			wantEvictions:   nil,
 		},
 		{
@@ -410,7 +411,7 @@ func TestCompactor(t *testing.T) {
 					{PodName: "pod-0", VReplicas: int32(2)},
 					{PodName: "pod-2", VReplicas: int32(7)}}),
 			},
-			schedulerPolicy: MAXFILLUP,
+			schedulerPolicy: scheduler.MAXFILLUP,
 			wantEvictions: map[types.NamespacedName]duckv1alpha1.Placement{
 				{Name: "vpod-2", Namespace: testNs}: {PodName: "pod-2", VReplicas: int32(7)},
 			},
@@ -419,11 +420,11 @@ func TestCompactor(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, _ := setupFakeContext(t)
+			ctx, _ := tscheduler.SetupFakeContext(t)
 
 			vpodClient := tscheduler.NewVPodClient()
 			ls := listers.NewListers(nil)
-			stateAccessor := newStateBuilder(ctx, vpodClient.List, 10, tc.schedulerPolicy, ls.GetNodeLister())
+			stateAccessor := state.NewStateBuilder(ctx, vpodClient.List, 10, tc.schedulerPolicy, ls.GetNodeLister())
 
 			evictions := make(map[types.NamespacedName]duckv1alpha1.Placement)
 			recordEviction := func(vpod scheduler.VPod, from *duckv1alpha1.Placement) error {
