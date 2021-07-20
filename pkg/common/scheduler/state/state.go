@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package statefulset
+package state
 
 import (
 	"context"
+	"fmt"
 
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/labels"
@@ -27,56 +28,59 @@ import (
 	"knative.dev/pkg/logging"
 )
 
-type stateAccessor interface {
+type StateAccessor interface {
 	// State returns the current state (snapshot) about placed vpods
 	// Take into account reserved vreplicas and update `reserved` to reflect
 	// the current state.
-	State(reserved map[types.NamespacedName]map[string]int32) (*state, error)
+	State(reserved map[types.NamespacedName]map[string]int32) (*State, error)
 }
 
 // state provides information about the current scheduling of all vpods
 // It is used by for the scheduler and the autoscaler
-type state struct {
+type State struct {
 	// free tracks the free capacity of each pod.
-	free []int32
+	FreeCap []int32
 
-	// lastOrdinal is the ordinal index corresponding to the last statefulset replica
+	// LastOrdinal is the ordinal index corresponding to the last statefulset replica
 	// with placed vpods.
-	lastOrdinal int32
+	LastOrdinal int32
 
 	// Pod capacity.
-	capacity int32
+	Capacity int32
 
 	// Number of zones in cluster
-	numZones int32
+	NumZones int32
+
+	// Number of available nodes in cluster
+	NumNodes int32
 
 	// Scheduling policy type for placing vreplicas on pods
-	schedulerPolicy SchedulerPolicyType
+	SchedulerPolicy scheduler.SchedulerPolicyType
 
 	// Mapping node names of nodes currently in cluster to their zone info
-	nodeToZoneMap map[string]string
+	NodeToZoneMap map[string]string
 }
 
 // Free safely returns the free capacity at the given ordinal
-func (s *state) Free(ordinal int32) int32 {
-	if int32(len(s.free)) <= ordinal {
-		return s.capacity
+func (s *State) Free(ordinal int32) int32 {
+	if int32(len(s.FreeCap)) <= ordinal {
+		return s.Capacity
 	}
-	return s.free[ordinal]
+	return s.FreeCap[ordinal]
 }
 
 // SetFree safely sets the free capacity at the given ordinal
-func (s *state) SetFree(ordinal int32, value int32) {
-	s.free = grow(s.free, ordinal, s.capacity)
-	s.free[int(ordinal)] = value
+func (s *State) SetFree(ordinal int32, value int32) {
+	s.FreeCap = grow(s.FreeCap, ordinal, s.Capacity)
+	s.FreeCap[int(ordinal)] = value
 }
 
 // freeCapacity returns the number of vreplicas that can be used,
 // up to the last ordinal
-func (s *state) freeCapacity() int32 {
+func (s *State) FreeCapacity() int32 {
 	t := int32(0)
-	for i := int32(0); i <= s.lastOrdinal; i++ {
-		t += s.free[i]
+	for i := int32(0); i <= s.LastOrdinal; i++ {
+		t += s.FreeCap[i]
 	}
 	return t
 }
@@ -87,12 +91,12 @@ type stateBuilder struct {
 	logger          *zap.SugaredLogger
 	vpodLister      scheduler.VPodLister
 	capacity        int32
-	schedulerPolicy SchedulerPolicyType
+	schedulerPolicy scheduler.SchedulerPolicyType
 	nodeLister      corev1.NodeLister
 }
 
-// newStateBuilder returns a StateAccessor recreating the state from scratch each time it is requested
-func newStateBuilder(ctx context.Context, lister scheduler.VPodLister, podCapacity int32, schedulerPolicy SchedulerPolicyType, nodeLister corev1.NodeLister) stateAccessor {
+// NewStateBuilder returns a StateAccessor recreating the state from scratch each time it is requested
+func NewStateBuilder(ctx context.Context, lister scheduler.VPodLister, podCapacity int32, schedulerPolicy scheduler.SchedulerPolicyType, nodeLister corev1.NodeLister) StateAccessor {
 	return &stateBuilder{
 		ctx:             ctx,
 		logger:          logging.FromContext(ctx),
@@ -103,7 +107,7 @@ func newStateBuilder(ctx context.Context, lister scheduler.VPodLister, podCapaci
 	}
 }
 
-func (s *stateBuilder) State(reserved map[types.NamespacedName]map[string]int32) (*state, error) {
+func (s *stateBuilder) State(reserved map[types.NamespacedName]map[string]int32) (*State, error) {
 	vpods, err := s.vpodLister()
 	if err != nil {
 		return nil, err
@@ -147,18 +151,21 @@ func (s *stateBuilder) State(reserved map[types.NamespacedName]map[string]int32)
 		}
 	}
 
-	if s.schedulerPolicy == EVENSPREAD {
+	if s.schedulerPolicy == scheduler.EVENSPREAD || s.schedulerPolicy == scheduler.EVENSPREAD_BYNODE {
 		//TODO: need a node watch to see if # nodes/ # zones have gone up or down
 		nodes, err := s.nodeLister.List(labels.Everything())
 		if err != nil {
 			return nil, err
 		}
 
-		nodeToZoneMap := make(map[string]string, len(nodes))
+		nodeToZoneMap := make(map[string]string)
 		zoneMap := make(map[string]struct{})
 		for i := 0; i < len(nodes); i++ {
 			node := nodes[i]
-			zoneName, ok := node.GetLabels()[ZoneLabel]
+			if node.Spec.Unschedulable {
+				continue //ignore node that is currently unschedulable
+			}
+			zoneName, ok := node.GetLabels()[scheduler.ZoneLabel]
 			if !ok {
 				continue //ignore node that doesn't have zone info (maybe a test setup or control node)
 			}
@@ -167,14 +174,15 @@ func (s *stateBuilder) State(reserved map[types.NamespacedName]map[string]int32)
 			zoneMap[zoneName] = struct{}{}
 		}
 
-		return &state{free: free, lastOrdinal: last, capacity: s.capacity, numZones: int32(len(zoneMap)), schedulerPolicy: s.schedulerPolicy, nodeToZoneMap: nodeToZoneMap}, nil
+		s.logger.Infow("cluster state info", zap.String("NumZones", fmt.Sprint(len(zoneMap))), zap.String("NumNodes", fmt.Sprint(len(nodeToZoneMap))))
+		return &State{FreeCap: free, LastOrdinal: last, Capacity: s.capacity, NumZones: int32(len(zoneMap)), NumNodes: int32(len(nodeToZoneMap)), SchedulerPolicy: s.schedulerPolicy, NodeToZoneMap: nodeToZoneMap}, nil
 
 	}
-	return &state{free: free, lastOrdinal: last, capacity: s.capacity, schedulerPolicy: s.schedulerPolicy}, nil
+	return &State{FreeCap: free, LastOrdinal: last, Capacity: s.capacity, SchedulerPolicy: s.schedulerPolicy}, nil
 }
 
 func (s *stateBuilder) updateFreeCapacity(free []int32, last int32, podName string, vreplicas int32) ([]int32, int32) {
-	ordinal := ordinalFromPodName(podName)
+	ordinal := OrdinalFromPodName(podName)
 	free = grow(free, ordinal, s.capacity)
 
 	free[ordinal] -= vreplicas

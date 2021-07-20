@@ -47,9 +47,10 @@ import (
 )
 
 type envConfig struct {
-	SchedulerRefreshPeriod int64                            `envconfig:"AUTOSCALER_REFRESH_PERIOD" required:"true"`
-	PodCapacity            int32                            `envconfig:"POD_CAPACITY" required:"true"`
-	SchedulerPolicy        stsscheduler.SchedulerPolicyType `envconfig:"SCHEDULER_POLICY_TYPE" required:"true"`
+	SchedulerRefreshPeriod   int64                         `envconfig:"AUTOSCALER_REFRESH_PERIOD" required:"true"`
+	PodCapacity              int32                         `envconfig:"POD_CAPACITY" required:"true"`
+	SchedulerPolicyType      scheduler.SchedulerPolicyType `envconfig:"SCHEDULER_POLICY_TYPE" required:"true"`
+	SchedulerPolicyConfigMap string                        `envconfig:"CONFIG_SCHEDULER" required:"true"`
 }
 
 func NewController(
@@ -119,15 +120,19 @@ func NewController(
 
 		patched, err := kafkaclient.Get(ctx).SourcesV1beta1().KafkaSources(key.Namespace).Patch(ctx, key.Name, types.JSONPatchType, patch, metav1.PatchOptions{}, "status")
 		if err != nil {
-			return fmt.Errorf("Failed patching: %w", err)
+			return fmt.Errorf("failed patching: %w", err)
 		}
 		logging.FromContext(ctx).Debugw("Patched resource", zap.Any("patch", patch), zap.Any("patched", patched))
 		return nil
 	}
 
-	c.scheduler = stsscheduler.NewScheduler(ctx,
-		system.Namespace(), mtadapterName, c.vpodLister, rp, env.PodCapacity, env.SchedulerPolicy,
-		nodeInformer.Lister(), evictor)
+	policy := &stsscheduler.SchedulerPolicy{}
+	if err := initPolicyFromConfigMap(ctx, env.SchedulerPolicyConfigMap, policy); err != nil {
+		return nil
+	}
+
+	logging.FromContext(ctx).Debugw("Scheduler Policy Config Map read", zap.Any("policy", policy))
+	c.scheduler = stsscheduler.NewScheduler(ctx, system.Namespace(), mtadapterName, c.vpodLister, rp, env.PodCapacity, env.SchedulerPolicyType, nodeInformer.Lister(), evictor, policy)
 
 	logging.FromContext(ctx).Info("Setting up kafka event handlers")
 	kafkaInformer.Informer().AddEventHandler(controller.HandleAll(impl.Enqueue))
